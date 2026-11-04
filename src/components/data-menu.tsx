@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, Database, FileDown, FolderOpen, Settings2 } from "lucide-react";
+import { ArrowDownToLine, ArrowUpFromLine, FileDown, FolderOpen, Menu, Settings2 } from "lucide-react";
 
 type Change = (event: React.ChangeEvent<HTMLInputElement>) => void;
 
 /**
- * All import, export and settings actions behind one header button. The file inputs stay
+ * The app menu: import, export and settings behind one header button. The file inputs stay
  * mounted outside the dropdown so a picker can still deliver its files after the menu closes.
  */
 export default function DataMenu({ importFolder, importHistoryFiles, importPositions, importBackup, openExport, downloadTemplate, openSettings }: {
@@ -36,7 +36,7 @@ export default function DataMenu({ importFolder, importHistoryFiles, importPosit
     <button type="button" role="menuitem" onClick={run(onClick)} className={item}><span className="mt-0.5 text-[#718096]">{icon}</span><span><span className="block text-sm text-[#17212b]">{label}</span>{hint && <span className="block text-xs text-[#a0aab5]">{hint}</span>}</span></button>;
 
   return <div ref={root} className="relative">
-    <button type="button" onClick={() => setOpen(value => !value)} aria-haspopup="menu" aria-expanded={open} className="flex items-center gap-1.5 rounded-lg border border-[#e7ebef] px-3 py-2 text-sm text-[#3f4a56] hover:bg-[#f7f8fa]"><Database size={15} /><span className="hidden sm:inline">Data</span><ChevronDown size={14} /></button>
+    <button type="button" onClick={() => setOpen(value => !value)} aria-haspopup="menu" aria-expanded={open} aria-label="Menu" title="Import, export and settings" className="rounded-lg p-2 text-[#3f4a56] hover:bg-[#f7f8fa]"><Menu size={20} /></button>
     {open && <div role="menu" className="absolute right-0 z-20 mt-2 w-72 rounded-xl border border-[#e7ebef] bg-white p-1.5 shadow-lg">
       <p className="px-3 pb-1 pt-2 text-[10px] uppercase tracking-wide text-[#a0aab5]">Import</p>
       <Item icon={<FolderOpen size={16} />} label="Import from data folder" hint="Every Date,Balance,Account CSV in a folder" onClick={() => folder.current?.click()} />

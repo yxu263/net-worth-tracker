@@ -18,7 +18,7 @@ Cloudflare Worker       <-- price proxy to Yahoo Finance (browsers cannot call Y
 2. **App repo (public).** Create a public repo (e.g. `net-worth-tracker`) on github.com and push this folder. `.gitignore` already excludes `node_modules`, build output and the personal `data/` folder. In the repo: *Settings -> Pages -> Source: GitHub Actions*. The workflow in `.github/workflows/deploy.yml` builds and publishes on every push to `main`.
 3. **Data repo (private).** Create a private repo (e.g. `net-worth-data`) and tick *Add a README* so the `main` branch exists.
 4. **Token.** GitHub -> *Settings -> Developer settings -> Fine-grained tokens*: repository access = only the data repo, permission *Contents: Read and write*.
-5. Open the Pages URL, click the gear (**Settings**), enter the Worker URL (press **Test**) and the GitHub owner, data repo and token, then **Save settings**. Repeat step 5 on each device; the first sync on a device with no data loads the GitHub copy automatically.
+5. Open the Pages URL, open the menu (☰) -> **Settings**, enter the Worker URL (press **Test**) and the GitHub owner, data repo and token, then **Save settings**. Repeat step 5 on each device; the first sync on a device with no data loads the GitHub copy automatically.
 
 The token and Worker URL are stored only in each browser's `localStorage`, never in the synced file.
 
@@ -56,7 +56,7 @@ The **Goals** tab tracks targets for net worth, one account's balance, or paying
 
 ## Export and import
 
-All import and export actions live in the **Data** menu in the header (next to Settings). **Export…** opens a dialog with:
+All import and export actions live in the **menu** (☰) at the top right, together with **Settings**; the sync status dot also opens Settings. **Export…** opens a dialog with:
 
 - **Daily balance history (CSV)** for all or selected accounts and debts, optional date range. Layout is either one column per account (plus Total) for spreadsheets, or `Date,Balance,Account` rows, the same format **Bulk import CSVs** reads. *Every calendar day* carries each balance forward between recorded changes; untick it to export only recorded dates. Debts are negative.
 - **Current positions (CSV)**: accounts, debts and holdings as of today; re-import with **Import CSV**.
