@@ -14,7 +14,7 @@ import { defaultSettings, loadSettings, loadSyncState, saveSettings, saveSyncSta
 import { downloadFile } from "@/lib/export";
 import { cpiLastMonth, deflate, inTodaysDollars } from "@/lib/inflation";
 import type { AllocationItem } from "@/lib/allocation";
-import { accountTotal, money, safeNumber } from "@/lib/values";
+import { accountTotal, holdingValue, money, safeNumber } from "@/lib/values";
 import NetWorthChart from "@/components/net-worth-chart";
 import SettingsForm from "@/components/settings-form";
 import ExportPanel from "@/components/export-panel";
@@ -127,6 +127,37 @@ function loadData(): { data: TrackerData; failed: boolean } {
   }
 }
 const today = () => todayIso();
+/** One holding row as edited inside the account dialog, before it is saved. */
+type HoldingDraft = { id: string; ticker: string; quantity: string; costBasis: string; isNew: boolean };
+const parseJsonList = <T,>(value: FormDataEntryValue | null): T[] => { try { const parsed = JSON.parse(String(value ?? "[]")); return Array.isArray(parsed) ? parsed as T[] : []; } catch { return []; } };
+const priceFields = (holding?: Holding) => ({ price: safeNumber(holding?.price), priceUpdatedAt: holding?.priceUpdatedAt, priceUpdatedAtTime: holding?.priceUpdatedAtTime, priceBasis: holding?.priceBasis, previousClose: holding?.previousClose, changePercent: holding?.changePercent });
+/**
+ * Applies the holdings edited in the account dialog. Unchanged positions keep their price;
+ * a new or re-tickered one takes the price, expected return and asset class its ticker
+ * already has in another account (or 0 until priced, reported as unpriced). Rows with no ticker are ignored.
+ */
+function applyHoldingEdits(holdings: Holding[], accountId: string, drafts: HoldingDraft[], removedIds: string[]): { holdings: Holding[]; unpricedTickers: string[] } {
+  const removedSet = new Set(removedIds);
+  const kept = holdings.filter(holding => !(holding.accountId === accountId && removedSet.has(holding.id)));
+  const peerOf = (ticker: string, except?: string) => kept.find(holding => holding.id !== except && tickerKey(holding.ticker) === ticker);
+  const amount = (value: string) => { const parsed = Number(value); return Number.isFinite(parsed) ? Math.max(0, parsed) : 0; };
+  const valid = drafts.filter(draft => tickerKey(draft.ticker));
+  const byId = new Map(valid.map(draft => [draft.id, draft]));
+  const unpriced = new Set<string>();
+  const inherit = (ticker: string, except?: string) => { const peer = peerOf(ticker, except); if (!(safeNumber(peer?.price) > 0)) unpriced.add(ticker); return { ...priceFields(peer), expectedAnnualReturn: safeNumber(peer?.expectedAnnualReturn), assetClass: peer?.assetClass }; };
+  const updated = kept.map(holding => {
+    const draft = holding.accountId === accountId ? byId.get(holding.id) : undefined;
+    if (!draft) return holding;
+    const ticker = tickerKey(draft.ticker);
+    const sizes = { quantity: amount(draft.quantity), costBasis: amount(draft.costBasis) };
+    return ticker === tickerKey(holding.ticker) ? { ...holding, ...sizes } : { ...holding, ...sizes, ticker, ...inherit(ticker, holding.id) };
+  });
+  const added = valid.filter(draft => draft.isNew && !kept.some(holding => holding.id === draft.id)).map(draft => {
+    const ticker = tickerKey(draft.ticker);
+    return { id: draft.id, accountId, ticker, quantity: amount(draft.quantity), costBasis: amount(draft.costBasis), ...inherit(ticker) };
+  });
+  return { holdings: [...updated, ...added], unpricedTickers: [...unpriced] };
+}
 const greeting = (hour = new Date().getHours()) => hour < 5 ? "Good evening" : hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
 /** How often to re-quote while the regular session is running. Kept conservative so
  * Yahoo's public endpoint is not rate-limited or blocked. */
@@ -441,13 +472,23 @@ export default function Home() {
     const existing = editing as Account | null;
     const cash = Number(form.get("cash"));
     if (!Number.isFinite(cash)) return;
-    const account: Account = { id: existing?.id ?? id(), name: String(form.get("name")), institution: String(form.get("institution")), type: String(form.get("type")) as AccountType, balance: cash, color: existing?.color ?? "#8aa9e8", cashConfigured: true, expectedAnnualReturn: Number(form.get("expectedAnnualReturn") ?? 0) || 0, monthlyContribution: Math.max(0, Number(form.get("monthlyContribution") ?? 0) || 0), contributionGrowth: form.get("contributionGrowth") === "on", contributionGrowthRate: Number(form.get("contributionGrowthRate") ?? 0) || 0, contributionTarget: String(form.get("contributionTarget") ?? "pro-rata"), contributionYears: Math.max(0, Number(form.get("contributionYears") ?? 0) || 0) };
-    const linked = data.holdings.filter(holding => holding.accountId === account.id);
-    const total = cash + linked.reduce((sum, holding) => sum + safeNumber(holding.quantity) * safeNumber(holding.price), 0);
-    setData(current => ({ ...current, accounts: existing ? current.accounts.map(item => item.id === account.id ? account : item) : [...current.accounts, account], accountSnapshots: upsertAccountSnapshot(current.accountSnapshots ?? [], account.id, today(), total) }));
+    const account: Account = { ...existing, id: existing?.id ?? id(), name: String(form.get("name")), institution: String(form.get("institution")), type: String(form.get("type")) as AccountType, balance: cash, color: existing?.color ?? "#8aa9e8", cashConfigured: true, expectedAnnualReturn: Number(form.get("expectedAnnualReturn") ?? 0) || 0, monthlyContribution: Math.max(0, Number(form.get("monthlyContribution") ?? 0) || 0), contributionGrowth: form.get("contributionGrowth") === "on", contributionGrowthRate: Number(form.get("contributionGrowthRate") ?? 0) || 0, contributionTarget: String(form.get("contributionTarget") ?? "pro-rata"), contributionYears: Math.max(0, Number(form.get("contributionYears") ?? 0) || 0) };
+    const drafts = parseJsonList<HoldingDraft>(form.get("holdingDrafts"));
+    const removedIds = parseJsonList<string>(form.get("removedHoldings"));
+    const preview = applyHoldingEdits(data.holdings, account.id, drafts, removedIds);
+    const linked = preview.holdings.filter(holding => holding.accountId === account.id);
+    const total = cash + linked.reduce((sum, holding) => sum + holdingValue(holding), 0);
+    setData(current => {
+      const edited = applyHoldingEdits(current.holdings, account.id, drafts, removedIds).holdings;
+      const balance = cash + edited.filter(holding => holding.accountId === account.id).reduce((sum, holding) => sum + holdingValue(holding), 0);
+      return { ...current, accounts: existing ? current.accounts.map(item => item.id === account.id ? account : item) : [...current.accounts, account], holdings: edited, accountSnapshots: upsertAccountSnapshot(current.accountSnapshots ?? [], account.id, today(), balance), deleted: removedIds.length ? markDeleted(current.deleted, removedIds) : current.deleted };
+    });
     closeModal();
     flash(`${account.name} set to ${money(total)}${linked.length ? ` (${money(cash)} cash + ${linked.length} holding${linked.length === 1 ? "" : "s"})` : ""}`);
-    if (linked.length) void syncPrices(true);
+    const tickers = [...new Set(linked.map(holding => tickerKey(holding.ticker)))];
+    if (!tickers.length) return;
+    if (!settingsRef.current.priceProxyUrl) { if (preview.unpricedTickers.length) flash(`${preview.unpricedTickers.join(", ")} saved without a price. Set your price proxy URL in Settings to look it up.`); return; }
+    void syncPrices(true, tickers);
   }
   function saveLiability(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -528,8 +569,8 @@ export default function Home() {
   }
   const savedToday = useMemo(() => (data.snapshots ?? []).some(item => item.date === dayStamp), [data.snapshots, dayStamp]);
 
-  async function syncPrices(auto = false) {
-    const tickers = [...new Set(data.holdings.map(holding => holding.ticker.trim().toUpperCase()).filter(Boolean))];
+  async function syncPrices(auto = false, only?: string[]) {
+    const tickers = only ?? [...new Set(data.holdings.map(holding => holding.ticker.trim().toUpperCase()).filter(Boolean))];
     if (!tickers.length) { if (!auto) flash("Add a holding with a ticker first"); return; }
     const proxy = settingsRef.current.priceProxyUrl;
     if (!proxy) { if (!auto) { flash("Set your price proxy URL in Settings to look up prices"); setPanel("settings"); } return; }
@@ -671,7 +712,7 @@ export default function Home() {
     {tickerEdit && <Modal title={`${tickerEdit} expected return`} close={() => setTickerEdit(null)}><TickerForm ticker={tickerEdit} data={data} save={saveTickerReturn} /></Modal>}
     {panel === "settings" && <Modal wide title="Settings" close={() => setPanel(null)}><SettingsForm settings={settings} status={syncInfo} onSave={saveAppSettings} onSyncNow={() => void runSync(true)} onDisconnect={disconnectSync} /></Modal>}
     {panel === "export" && <Modal wide title="Export data" close={() => setPanel(null)}><ExportPanel data={data} exportPositions={exportCsv} exportBackup={exportBackup} notify={flash} /></Modal>}
-    {modal && <Modal title={`${editing ? "Edit" : "Add"} ${modal}`} close={closeModal}>{modal === "account" && <AccountForm item={editing as Account | null} data={data} save={saveAccount} />}{modal === "liability" && <LiabilityForm item={editing as Liability | null} save={saveLiability} />}{modal === "holding" && <HoldingForm item={editing as Holding | null} data={data} save={saveHolding} />}</Modal>}
+    {modal && <Modal wide={modal === "account"} title={`${editing ? "Edit" : "Add"} ${modal}`} close={closeModal}>{modal === "account" && <AccountForm item={editing as Account | null} data={data} save={saveAccount} />}{modal === "liability" && <LiabilityForm item={editing as Liability | null} save={saveLiability} />}{modal === "holding" && <HoldingForm item={editing as Holding | null} data={data} save={saveHolding} />}</Modal>}
   </main>;
 }
 
@@ -981,15 +1022,52 @@ function Modal({ title, close, children, wide = false }: { title: string; close:
   }, []);
   return <div className="fixed inset-0 z-10 flex items-center justify-center bg-[#17212b]/40 p-5"><div ref={panel} tabIndex={-1} role="dialog" aria-modal="true" aria-label={title} className={`card max-h-[calc(100dvh-2.5rem)] w-full overflow-y-auto overscroll-contain ${wide ? "max-w-2xl" : "max-w-md"} p-6 outline-none`}><div className="mb-5 flex items-center justify-between"><h2 className="text-lg font-semibold capitalize">{title}</h2><button type="button" aria-label="Close" onClick={close}><X size={20} /></button></div>{children}{hasForm && <p className="mt-4 text-center text-[11px] text-[#a0aab5]">Enter to save &middot; Esc to cancel</p>}</div></div>;
 }
-const Field = ({ label, name, defaultValue, type = "text" }: { label: string; name: string; defaultValue?: string | number; type?: string }) => <label className="mb-4 block text-sm"><span className="mb-1 block text-[#718096]">{label}</span><input name={name} type={type} defaultValue={defaultValue} required step={type === "number" ? "any" : undefined} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>;
+const inputClass = "w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]";
+const compactInput = "w-full min-w-0 rounded-lg border border-[#dfe5e9] px-2 py-1.5 outline-none focus:border-[#3b7fbd]";
+/** A "?" that reveals an explanation on demand, so forms stay short by default. */
+function HelpButton({ open, toggle, topic }: { open: boolean; toggle: () => void; topic: string }) {
+  return <button type="button" onClick={toggle} aria-expanded={open} aria-label={`${open ? "Hide" : "Show"} help: ${topic}`} title="What is this?" className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold leading-none ${open ? "border-[#3b7fbd] bg-[#3b7fbd] text-white" : "border-[#c9d2da] text-[#718096] hover:border-[#3b7fbd] hover:text-[#3b7fbd]"}`}>?</button>;
+}
+const HelpText = ({ children }: { children: React.ReactNode }) => <div className="mt-2 rounded-lg bg-[#f2f7fa] p-3 text-xs leading-relaxed text-[#4a5568]">{children}</div>;
+/** Label beside its control on wider screens, stacked above it on a phone. */
+function FormRow({ label, id: controlId, help, children }: { label: string; id?: string; help?: React.ReactNode; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return <div className="mb-3 text-sm">
+    <div className="grid items-center gap-x-3 gap-y-1 sm:grid-cols-[11rem_minmax(0,1fr)]">
+      <div className="flex items-center gap-1.5 text-[#718096]"><label htmlFor={controlId}>{label}</label>{help && <HelpButton open={open} toggle={() => setOpen(value => !value)} topic={label} />}</div>
+      <div className="min-w-0">{children}</div>
+    </div>
+    {help && open && <HelpText>{help}</HelpText>}
+  </div>;
+}
+/** A bordered group with its title on the left and actions plus an optional "?" at the top right. */
+function FormSection({ title, help, action, children }: { title: string; help?: React.ReactNode; action?: React.ReactNode; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return <div className="mb-4 rounded-lg border border-[#e7ebef] p-3">
+    <div className="mb-2 flex items-center justify-between gap-2"><p className="text-xs font-medium uppercase tracking-wide text-[#718096]">{title}</p><div className="flex items-center gap-3">{action}{help && <HelpButton open={open} toggle={() => setOpen(value => !value)} topic={title} />}</div></div>
+    {help && open && <div className="-mt-1 mb-3"><HelpText>{help}</HelpText></div>}
+    {children}
+  </div>;
+}
+const Field = ({ label, name, defaultValue, type = "text", help, required = true, min, placeholder }: { label: string; name: string; defaultValue?: string | number; type?: string; help?: React.ReactNode; required?: boolean; min?: string; placeholder?: string }) => <FormRow label={label} id={`field-${name}`} help={help}><input id={`field-${name}`} name={name} type={type} defaultValue={defaultValue} required={required} min={min} placeholder={placeholder} step={type === "number" ? "any" : undefined} className={inputClass} /></FormRow>;
 function FormActions() { return <div className="flex justify-end gap-2"><button type="submit" className="rounded-lg bg-[#17212b] px-4 py-2 text-sm text-white">Save</button></div>; }
 function AccountForm({ item, data, save }: { item: Account | null; data: TrackerData; save: (event: React.FormEvent<HTMLFormElement>) => void }) {
   const linked = item ? data.holdings.filter(holding => holding.accountId === item.id) : [];
-  const holdingsValue = linked.reduce((sum, holding) => sum + safeNumber(holding.quantity) * safeNumber(holding.price), 0);
-  const [cash, setCash] = useState(() => String(item && !item.cashConfigured && holdingsValue > 0 ? Math.max(0, safeNumber(item.balance) - holdingsValue) : safeNumber(item?.balance)));
+  const originalHoldingsValue = linked.reduce((sum, holding) => sum + holdingValue(holding), 0);
+  const [drafts, setDrafts] = useState<HoldingDraft[]>(() => linked.map(holding => ({ id: holding.id, ticker: holding.ticker, quantity: String(safeNumber(holding.quantity)), costBasis: String(safeNumber(holding.costBasis)), isNew: false })));
+  const [removed, setRemoved] = useState<string[]>([]);
+  const [cash, setCash] = useState(() => String(item && !item.cashConfigured && originalHoldingsValue > 0 ? Math.max(0, safeNumber(item.balance) - originalHoldingsValue) : safeNumber(item?.balance)));
   const [type, setType] = useState<AccountType>(item?.type ?? "cash");
   const [contribution, setContribution] = useState(() => String(safeNumber(item?.monthlyContribution)));
   const [growsWithInflation, setGrowsWithInflation] = useState(() => Boolean(item?.contributionGrowth));
+  // An unchanged position keeps its own price; a new or re-tickered one starts at the price the ticker has elsewhere.
+  const priceOf = (draft: HoldingDraft) => {
+    const original = linked.find(holding => holding.id === draft.id);
+    if (original && tickerKey(original.ticker) === tickerKey(draft.ticker)) return safeNumber(original.price);
+    return safeNumber(data.holdings.find(holding => tickerKey(holding.ticker) === tickerKey(draft.ticker))?.price);
+  };
+  const draftValue = (draft: HoldingDraft) => (Number(draft.quantity) || 0) * priceOf(draft);
+  const holdingsValue = drafts.reduce((sum, draft) => sum + draftValue(draft), 0);
   const typedCash = Number(cash);
   const cashValue = Number.isFinite(typedCash) ? typedCash : 0;
   const total = cashValue + holdingsValue;
@@ -997,56 +1075,76 @@ function AccountForm({ item, data, save }: { item: Account | null; data: Tracker
   const difference = recorded ? total - safeNumber(recorded.balance) : 0;
   const matchCash = recorded ? Math.max(0, safeNumber(recorded.balance) - holdingsValue) : 0;
   const cashLabel = type === "property" ? "Property value" : type === "other" ? "Account value" : "Cash balance";
+  const update = (draftId: string, patch: Partial<HoldingDraft>) => setDrafts(current => current.map(draft => draft.id === draftId ? { ...draft, ...patch } : draft));
+  const drop = (draft: HoldingDraft) => { setDrafts(current => current.filter(entry => entry.id !== draft.id)); if (!draft.isNew) setRemoved(current => [...current, draft.id]); };
+  const addDraft = () => setDrafts(current => [...current, { id: id(), ticker: "", quantity: "", costBasis: "", isNew: true }]);
+  const showHoldings = type !== "property" || drafts.length > 0;
+  const rowGrid = "grid grid-cols-[4.75rem_minmax(0,1fr)_minmax(0,1fr)_1.25rem] items-center gap-2 sm:grid-cols-[5.5rem_minmax(0,1fr)_minmax(0,1fr)_6.5rem_1.25rem]";
   return <form onSubmit={save}>
+    <input type="hidden" name="holdingDrafts" value={JSON.stringify(drafts)} />
+    <input type="hidden" name="removedHoldings" value={JSON.stringify(removed)} />
     <Field label="Account name" name="name" defaultValue={item?.name} />
     <Field label="Institution" name="institution" defaultValue={item?.institution} />
-    <label className="mb-4 block text-sm"><span className="mb-1 block text-[#718096]">Type</span><select name="type" value={type} onChange={event => setType(event.target.value as AccountType)} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2">{accountTypes.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}</select></label>
-    <label className="mb-2 block text-sm"><span className="mb-1 block text-[#718096]">{cashLabel}</span><input name="cash" type="number" step="any" required value={cash} onChange={event => setCash(event.target.value)} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>
-    <p className="mb-4 text-xs text-[#718096]">The account total is not edited directly. It is this {cashLabel.toLowerCase()} plus the market value of any holdings linked to this account, so holdings are counted once.</p>
-    <div className="mb-4 rounded-lg bg-[#f7f8fa] p-3 text-sm">
-      <div className="flex justify-between py-1"><span className="text-[#718096]">{cashLabel}</span><span>{money(cashValue)}</span></div>
-      <div className="flex justify-between py-1"><span className="text-[#718096]">Linked holdings ({linked.length})</span><span>{money(holdingsValue)}</span></div>
-      <div className="mt-1 flex justify-between border-t border-[#e1e6ea] pt-2"><span className="font-medium">Account total</span><strong>{money(total)}</strong></div>
+    <FormRow label="Type" id="field-type"><select id="field-type" name="type" value={type} onChange={event => setType(event.target.value as AccountType)} className={inputClass}>{accountTypes.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}</select></FormRow>
+    <FormRow label={cashLabel} id="field-cash" help={`The account total is not typed in directly. It is this ${cashLabel.toLowerCase()} plus the market value of the holdings below, so each holding is counted once in net worth.`}><input id="field-cash" name="cash" type="number" step="any" required value={cash} onChange={event => setCash(event.target.value)} className={inputClass} /></FormRow>
+    {recorded && recorded.date !== today() && Math.round(Math.abs(difference)) !== 0 && <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#e7ebef] px-3 py-2 text-xs">
+      <span className="text-[#718096]">Last recorded {recorded.date}: <strong className="text-[#3f4a56]">{money(safeNumber(recorded.balance))}</strong> ({money(Math.abs(difference))} {difference > 0 ? "lower" : "higher"})</span>
+      <button type="button" onClick={() => setCash(String(Number(matchCash.toFixed(2))))} className="shrink-0 rounded-lg border border-[#dfe5e9] px-2 py-1 text-[#3b7fbd]">Match cash</button>
+    </div>}
+    {showHoldings && <FormSection title={`Holdings (${drafts.length})`} help="Each row is one position in this account. Cost basis is the total you paid. New or changed tickers are priced from Yahoo Finance when you save; a ticker already held in another account starts at that price. Expected return and asset class belong to the ticker: set them on the Holdings and Allocation tabs, and a new position inherits them. Removed rows are deleted only when you save." action={<button type="button" onClick={addDraft} className="flex items-center gap-1 text-xs font-medium text-[#3b7fbd]"><Plus size={13} />Add holding</button>}>
+      {drafts.length ? <div className="space-y-2 text-sm">
+        <div className={`${rowGrid} text-[11px] uppercase text-[#a0aab5]`}><span>Ticker</span><span>Shares</span><span>Cost basis</span><span className="hidden text-right sm:block">Value</span><span /></div>
+        {drafts.map(draft => <div key={draft.id} className={rowGrid}>
+          <input aria-label="Ticker" value={draft.ticker} placeholder="VTI" autoFocus={draft.isNew} onChange={event => update(draft.id, { ticker: event.target.value.toUpperCase() })} className={`${compactInput} uppercase`} />
+          <input aria-label={`${draft.ticker || "New holding"} shares`} type="number" step="any" min="0" value={draft.quantity} onChange={event => update(draft.id, { quantity: event.target.value })} className={compactInput} />
+          <input aria-label={`${draft.ticker || "New holding"} cost basis`} type="number" step="any" min="0" value={draft.costBasis} onChange={event => update(draft.id, { costBasis: event.target.value })} className={compactInput} />
+          <span className="hidden text-right tabular-nums sm:block">{priceOf(draft) > 0 ? money(draftValue(draft)) : <span className="text-xs text-[#a0aab5]">priced on save</span>}</span>
+          <button type="button" onClick={() => drop(draft)} aria-label={`Remove ${draft.ticker || "this holding"}`} className="text-[#b95d57]"><Trash2 size={15} /></button>
+        </div>)}
+      </div> : <p className="text-sm text-[#718096]">No holdings. Add one to track shares at market prices.</p>}
+    </FormSection>}
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 rounded-lg bg-[#f7f8fa] px-3 py-2 text-sm">
+      <span className="text-[#718096]">{money(cashValue)} {type === "property" ? "value" : "cash"}{showHoldings ? ` + ${money(holdingsValue)} holdings` : ""}</span>
+      <span>Total <strong>{money(total)}</strong></span>
     </div>
-    {recorded && recorded.date !== today() && <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-[#e7ebef] p-3 text-sm">
-      <div><p className="text-[#718096]">Last recorded total on {recorded.date}</p><p className="font-medium">{money(safeNumber(recorded.balance))}{Math.round(Math.abs(difference)) !== 0 ? ` · ${money(Math.abs(difference))} ${difference > 0 ? "higher" : "lower"} than above` : ""}</p></div>
-      <button type="button" onClick={() => setCash(String(Number(matchCash.toFixed(2))))} className="shrink-0 rounded-lg border border-[#dfe5e9] px-3 py-2 text-xs text-[#3b7fbd]">Match cash</button>
-    </div>}
-    {item && <div className="mb-4"><p className="mb-2 text-xs uppercase text-[#718096]">Linked holdings</p>{linked.length ? linked.map(holding => <div key={holding.id} className="flex justify-between border-t border-[#eef1f4] py-2 text-sm"><span>{holding.ticker} · {holding.quantity} shares{holding.priceUpdatedAt ? ` · ${priceText(safeNumber(holding.price))} on ${holding.priceUpdatedAt}` : ""}</span><strong>{money(safeNumber(holding.quantity) * safeNumber(holding.price))}</strong></div>) : <p className="text-sm text-[#718096]">No holdings linked. Add them from the Holdings tab and select this account.</p>}</div>}
-    <Field label={returnLabel(type)} name="expectedAnnualReturn" type="number" defaultValue={item?.expectedAnnualReturn ?? 0} />
-    <p className="mb-4 text-xs text-[#718096]">{type === "property" ? "Forecast compounds this property's value at this rate. Enter a negative number to model a declining market." : "Cash and savings accounts compound their balance at this rate in Forecast. Other types stay flat unless their holdings carry their own assumptions."}</p>
-    {acceptsContributions({ type } as Account) && <div className="mb-4 rounded-lg border border-[#e7ebef] p-3">
-      <p className="mb-3 text-xs uppercase tracking-wide text-[#718096]">Monthly contribution</p>
-      <label className="mb-3 block text-sm"><span className="mb-1 block text-[#718096]">Amount added each month ($)</span><input name="monthlyContribution" type="number" step="any" min="0" value={contribution} onChange={event => setContribution(event.target.value)} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>
-      <label className="mb-3 flex items-center gap-2 text-sm"><input type="checkbox" name="contributionGrowth" checked={growsWithInflation} onChange={event => setGrowsWithInflation(event.target.checked)} /><span>Grow this contribution each year with inflation</span></label>
-      {growsWithInflation && <label className="mb-3 block text-sm"><span className="mb-1 block text-[#718096]">Assumed annual inflation (%)</span><input name="contributionGrowthRate" type="number" step="any" defaultValue={item?.contributionGrowthRate ?? 3} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>}
-      <label className="block text-sm"><span className="mb-1 block text-[#718096]">Buy with this money</span><select name="contributionTarget" defaultValue={item?.contributionTarget ?? "pro-rata"} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2">
-        <option value="pro-rata">Split across current holdings (default)</option>
+    <Field label={returnLabel(type)} name="expectedAnnualReturn" type="number" defaultValue={item?.expectedAnnualReturn ?? 0} help={type === "property" ? "Forecast compounds this property's value at this rate. Enter a negative number to model a declining market." : "Cash and savings accounts compound their balance at this rate in Forecast, as does an imported total with no holdings. Holdings use their own ticker's expected return instead."} />
+    {acceptsContributions({ type } as Account) && <FormSection title="Monthly contribution" help={<>Deposits are added at the end of each month in Forecast. <strong>Grows yearly</strong> steps the amount up on each anniversary. <strong>Buy with</strong> decides where the money goes; the default splits it by today&apos;s mix{drafts.length ? ` (${drafts.filter(draft => draft.ticker).map(draft => `${tickerKey(draft.ticker)} ${(holdingsValue > 0 ? draftValue(draft) / holdingsValue * 100 : 0).toFixed(0)}%`).join(", ")})` : ""}, and with no holdings it accumulates as cash at the expected return. <strong>Stop after</strong> models retiring: the balance keeps compounding but receives no new money. Blank or 0 contributes for the whole forecast.</>}>
+      <FormRow label="Amount per month ($)" id="field-monthlyContribution"><input id="field-monthlyContribution" name="monthlyContribution" type="number" step="any" min="0" value={contribution} onChange={event => setContribution(event.target.value)} className={inputClass} /></FormRow>
+      <FormRow label="Grows yearly" id="field-contributionGrowth"><div className="flex items-center gap-2"><input id="field-contributionGrowth" type="checkbox" name="contributionGrowth" checked={growsWithInflation} onChange={event => setGrowsWithInflation(event.target.checked)} />{growsWithInflation ? <><input aria-label="Yearly increase (%)" name="contributionGrowthRate" type="number" step="any" defaultValue={item?.contributionGrowthRate ?? 3} className="w-20 rounded-lg border border-[#dfe5e9] px-2 py-1.5 text-right" /><span className="text-[#718096]">% a year</span></> : <span className="text-[#a0aab5]">off</span>}</div></FormRow>
+      <FormRow label="Buy with" id="field-contributionTarget"><select id="field-contributionTarget" name="contributionTarget" defaultValue={item?.contributionTarget ?? "pro-rata"} className={inputClass}>
+        <option value="pro-rata">Split across holdings (default)</option>
         <option value="cash">Hold as cash</option>
-        {linked.map(holding => <option key={holding.id} value={holding.id}>All into {holding.ticker}</option>)}
-      </select></label>
-      <label className="mt-3 block text-sm"><span className="mb-1 block text-[#718096]">Stop contributing after (years)</span><input name="contributionYears" type="number" step="1" min="0" placeholder="Leave blank to contribute for the whole forecast" defaultValue={item?.contributionYears ? String(item.contributionYears) : ""} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>
-      <p className="mt-1 text-xs text-[#718096]">Use this to model retiring or otherwise stopping deposits. The balance keeps compounding afterwards; it just stops receiving new money. Blank or 0 contributes for the full horizon.</p>
-      <p className="mt-2 text-xs text-[#718096]">{linked.length ? `Default splits each deposit by today's mix: ${linked.map(holding => `${holding.ticker} ${(holdingsValue > 0 ? safeNumber(holding.quantity) * safeNumber(holding.price) / holdingsValue * 100 : 0).toFixed(0)}%`).join(", ")}.` : "With no linked holdings the contribution accumulates as cash and compounds at the expected annual return above."}</p>
-    </div>}
+        {drafts.filter(draft => draft.ticker.trim()).map(draft => <option key={draft.id} value={draft.id}>All into {tickerKey(draft.ticker)}</option>)}
+      </select></FormRow>
+      <FormRow label="Stop after (years)" id="field-contributionYears"><input id="field-contributionYears" name="contributionYears" type="number" step="1" min="0" placeholder="Never" defaultValue={item?.contributionYears ? String(item.contributionYears) : ""} className={inputClass} /></FormRow>
+    </FormSection>}
     <FormActions />
   </form>;
 }
 function LiabilityForm({ item, save }: { item: Liability | null; save: (event: React.FormEvent<HTMLFormElement>) => void }) {
-  const payoff = item ? payoffMonths({ ...item, monthlyPayment: item.monthlyPayment, extraMonthly: item.extraMonthly }) : null;
+  const payoff = item ? payoffMonths(item) : null;
+  const payoffNote = payoff !== null ? `At the saved payment this loan retires in ${payoffLabel(payoff)}.` : safeNumber(item?.monthlyPayment) > 0 ? "The saved payment does not cover the monthly interest, so the balance would never fall." : "";
   return <form onSubmit={save}>
     <Field label="Liability name" name="name" defaultValue={item?.name} />
     <Field label="Institution" name="institution" defaultValue={item?.institution} />
-    <Field label="Balance" name="balance" type="number" defaultValue={item?.balance ?? 0} />
+    <Field label="Balance ($)" name="balance" type="number" defaultValue={item?.balance ?? 0} />
     <Field label="Interest rate (%)" name="rate" type="number" defaultValue={item?.rate ?? 0} />
-    <label className="mb-1 block text-sm"><span className="mb-1 block text-[#718096]">Monthly principal &amp; interest ($)</span><input name="monthlyPayment" type="number" step="any" min="0" defaultValue={item?.monthlyPayment ?? 0} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>
-    <p className="mb-4 text-xs text-[#718096]">Enter principal and interest only. If your lender bills one amount for taxes and insurance too, subtract the escrow portion &mdash; escrow never reduces the loan balance and including it would predict payoff years too early. Leave this at 0 to hold the balance flat in Forecast.</p>
-    <label className="mb-1 block text-sm"><span className="mb-1 block text-[#718096]">Extra principal each month ($)</span><input name="extraMonthly" type="number" step="any" min="0" defaultValue={item?.extraMonthly ?? 0} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>
-    <p className="mb-4 text-xs text-[#718096]">Optional. Anything you overpay goes straight against the balance.{payoff !== null ? ` At the saved payment this loan retires in ${payoffLabel(payoff)}.` : safeNumber(item?.monthlyPayment) > 0 ? " The saved payment does not cover the monthly interest, so the balance would never fall." : ""}</p>
+    <Field label="Monthly P&I ($)" name="monthlyPayment" type="number" min="0" required={false} defaultValue={item?.monthlyPayment ?? 0} help="Principal and interest only. If your lender bills one amount that includes taxes and insurance, subtract the escrow part: escrow never reduces the loan balance, and including it would predict payoff years too early. Leave at 0 to hold the balance flat in Forecast." />
+    <Field label="Extra principal ($/mo)" name="extraMonthly" type="number" min="0" required={false} defaultValue={item?.extraMonthly ?? 0} help="Optional. Anything you overpay each month goes straight against the balance." />
+    {payoffNote && <p className={`mb-3 text-xs sm:pl-[11.75rem] ${payoff === null ? "text-[#b95d57]" : "text-[#718096]"}`}>{payoffNote}</p>}
     <FormActions />
   </form>;
 }
-function HoldingForm({ item, data, save }: { item: Holding | null; data: TrackerData; save: (event: React.FormEvent<HTMLFormElement>) => void }) { return <form onSubmit={save}><label className="mb-4 block text-sm"><span className="mb-1 block text-[#718096]">Account</span><select name="accountId" defaultValue={item?.accountId ?? data.accounts[0]?.id} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2">{data.accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label><Field label="Ticker" name="ticker" defaultValue={item?.ticker} /><Field label="Quantity" name="quantity" type="number" defaultValue={item?.quantity ?? 0} /><Field label="Cost basis" name="costBasis" type="number" defaultValue={item?.costBasis ?? 0} /><Field label="Current price (optional)" name="price" type="number" defaultValue={item?.price ?? 0} /><p className="mb-4 text-xs text-[#718096]">Leave the price alone if you like &mdash; the app looks up the latest Yahoo Finance price when you save: the live quote during market hours, otherwise the most recent close.</p><p className="mb-4 text-xs text-[#718096]">Expected annual return belongs to the ticker, not to one account. Select the ticker in the holdings table to set it everywhere at once; a new position inherits the rate the symbol already uses.</p><FormActions /></form>; }
+function HoldingForm({ item, data, save }: { item: Holding | null; data: TrackerData; save: (event: React.FormEvent<HTMLFormElement>) => void }) {
+  return <form onSubmit={save}>
+    <FormRow label="Account" id="field-accountId"><select id="field-accountId" name="accountId" defaultValue={item?.accountId ?? data.accounts[0]?.id} className={inputClass}>{data.accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></FormRow>
+    <Field label="Ticker" name="ticker" defaultValue={item?.ticker} help="Expected annual return and asset class belong to the ticker, not to one account. Set them on the Holdings and Allocation tabs; a new position inherits whatever the symbol already uses." />
+    <Field label="Shares" name="quantity" type="number" defaultValue={item?.quantity ?? 0} />
+    <Field label="Cost basis ($ total)" name="costBasis" type="number" defaultValue={item?.costBasis ?? 0} />
+    <Field label="Price (optional)" name="price" type="number" defaultValue={item?.price ?? 0} help="Leave it alone if you like: the app looks up the latest Yahoo Finance price when you save, the live quote during market hours, otherwise the most recent close." />
+    <FormActions />
+  </form>;
+}
 function TickerForm({ ticker, data, save }: { ticker: string; data: TrackerData; save: (event: React.FormEvent<HTMLFormElement>) => void }) {
   const items = data.holdings.filter(holding => tickerKey(holding.ticker) === ticker);
   const returns = new Set(items.map(item => safeNumber(item.expectedAnnualReturn)));
