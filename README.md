@@ -56,7 +56,7 @@ The **Goals** tab tracks targets for net worth, one account's balance, or paying
 
 ## Export and import
 
-**Export** opens a dialog with:
+All import and export actions live in the **Data** menu in the header (next to Settings). **Export…** opens a dialog with:
 
 - **Daily balance history (CSV)** for all or selected accounts and debts, optional date range. Layout is either one column per account (plus Total) for spreadsheets, or `Date,Balance,Account` rows, the same format **Bulk import CSVs** reads. *Every calendar day* carries each balance forward between recorded changes; untick it to export only recorded dates. Debts are negative.
 - **Current positions (CSV)**: accounts, debts and holdings as of today; re-import with **Import CSV**.
