@@ -3,3 +3,7 @@
   command = "echo 'price proxy only'"
   publish = "netlify/public"
   functions = "netlify/functions"
+
+# Netlify auto-adds its Next.js plugin when it sees package.json; this site is not a Next.js deploy.
+[build.environment]
+  NETLIFY_NEXT_PLUGIN_SKIP = "true"
