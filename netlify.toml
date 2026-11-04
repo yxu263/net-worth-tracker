@@ -1,0 +1,5 @@
+# Netlify hosts only the price proxy function; the app itself is on GitHub Pages.
+[build]
+  command = "echo 'price proxy only'"
+  publish = "netlify/public"
+  functions = "netlify/functions"

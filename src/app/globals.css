@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+:root { --ink: #17212b; --muted: #718096; --paper: #f7f8fa; --line: #e7ebef; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font-family: Arial, Helvetica, sans-serif; }
+button, input, select { font: inherit; }
+.card { background: white; border: 1px solid var(--line); border-radius: 16px; }
+.tab-active { background: #17212b; color: white; }
+.tab { color: #718096; }
+.tab:hover { background: #eef1f4; color: #17212b; }
+.bar { background: linear-gradient(90deg, #40b88c, #86d4ae); }

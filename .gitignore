@@ -1,0 +1,8 @@
+node_modules
+.next
+out
+*.tsbuildinfo
+.env*
+# Personal balance history never goes to GitHub
+data/
+*.db
