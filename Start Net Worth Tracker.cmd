@@ -5,8 +5,8 @@ REM  - Until then, it serves the built app (out\) on http://localhost:3000 from 
 REM    No Node.js or admin rights are needed for this.
 title Net Worth Tracker
 cd /d "%~dp0"
-set "APP_URL="
-REM set "APP_URL=https://yourname.github.io/net-worth-tracker/"
+set "APP_URL=https://yxu263.github.io/net-worth-tracker/"
+REM To run the local copy (out\) instead, change the line above to: set "APP_URL="
 
 if defined APP_URL (
   start "" "%APP_URL%"
