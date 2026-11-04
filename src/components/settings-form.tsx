@@ -28,7 +28,7 @@ export default function SettingsForm({ settings, status, onSave, onSyncNow, onDi
     catch (error) { setTest(error instanceof Error ? error.message : "Failed"); }
   }
 
-  return <form onSubmit={event => { event.preventDefault(); onSave(draft); }} className="max-h-[70vh] space-y-5 overflow-y-auto pr-1">
+  return <form onSubmit={event => { event.preventDefault(); onSave(draft); }} className="space-y-5">
     <section>
       <h3 className="mb-1 font-semibold">Price lookup</h3>
       <p className="mb-3 text-xs text-[#718096]">      URL of your price proxy: the Netlify function (<code>https://&lt;site&gt;.netlify.app/quote</code>) or Cloudflare Worker. Prices come from Yahoo Finance through it.</p>

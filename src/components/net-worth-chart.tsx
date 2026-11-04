@@ -40,7 +40,7 @@ function niceTicks(min: number, max: number, count = 5) {
   return { ticks: ticks.length ? ticks : [min, max], step };
 }
 
-export default function NetWorthChart({ series, range, onRangeChange, label = "net worth", onBack }: { series: NetWorthPoint[]; range: RangeKey; onRangeChange: (range: RangeKey) => void; label?: string; onBack?: () => void }) {
+export default function NetWorthChart({ series, range, onRangeChange, label = "net worth", onBack, note, actions }: { series: NetWorthPoint[]; range: RangeKey; onRangeChange: (range: RangeKey) => void; label?: string; onBack?: () => void; note?: string; actions?: React.ReactNode }) {
   const [hover, setHover] = useState<number | null>(null);
   const [width, setWidth] = useState(880);
   const observerRef = useRef<ResizeObserver | null>(null);
@@ -101,7 +101,7 @@ export default function NetWorthChart({ series, range, onRangeChange, label = "n
   const spansYears = parseIso(last.date).getTime() - parseIso(first.date).getTime() > 400 * 86_400_000;
   const axisDate = spansYears ? monthYear : shortDate;
 
-  function locate(event: React.MouseEvent<SVGSVGElement>) {
+  function locate(event: React.PointerEvent<SVGSVGElement>) {
     if (!geometry) return;
     const bounds = event.currentTarget.getBoundingClientRect();
     // The viewBox can scale the drawing, so map the pointer back into user units.
@@ -122,14 +122,14 @@ export default function NetWorthChart({ series, range, onRangeChange, label = "n
             {exact(Math.abs(change))} ({Math.abs(changePct).toFixed(1)}%)
           </span>
         </div>
-        <p className="mt-1 text-xs text-[#718096]">{longDate(first.date)} – {longDate(last.date)}</p>
+        <p className="mt-1 text-xs text-[#718096]">{longDate(first.date)} – {longDate(last.date)}{note ? ` · ${note}` : ""}</p>
       </div>
-      <label className="text-sm">
+      <div className="flex flex-wrap items-center gap-2">{actions}<label className="text-sm">
         <span className="sr-only">History range</span>
         <select aria-label="History range" value={range} onChange={event => { onRangeChange(event.target.value as RangeKey); setHover(null); }} className="rounded-lg border border-[#dfe5e9] bg-white px-3 py-2">
           {rangeOptions.map(option => <option key={option.key} value={option.key}>{option.label}</option>)}
         </select>
-      </label>
+      </label></div>
     </div>
 
     <div ref={measureRef} className="relative">
@@ -141,7 +141,7 @@ export default function NetWorthChart({ series, range, onRangeChange, label = "n
         </div>
       </div>}
 
-      <svg width={width} height={HEIGHT} viewBox={`0 0 ${width} ${HEIGHT}`} preserveAspectRatio="xMidYMid meet" className="block max-w-full" role="img" aria-label={`${label} history`} onMouseMove={locate} onMouseLeave={() => setHover(null)}>
+      <svg width={width} height={HEIGHT} viewBox={`0 0 ${width} ${HEIGHT}`} preserveAspectRatio="xMidYMid meet" className="block max-w-full touch-pan-y" role="img" aria-label={`${label} history`} onPointerDown={locate} onPointerMove={locate} onPointerLeave={event => { if (event.pointerType === "mouse") setHover(null); }}>
         <defs>
           <linearGradient id="netWorthFill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#38b6d9" stopOpacity="0.35" />

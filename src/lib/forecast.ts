@@ -31,10 +31,10 @@ export function contributionSplit(account: Account, linked: Holding[], values: n
 }
 
 /**
- * Account value at each year 0..years, stepped monthly so contributions compound
- * realistically rather than being applied as one lump at year end.
+ * Account value at each year 0..years (or each month 0..years*12 when `monthly`), stepped
+ * monthly so contributions compound realistically rather than as one lump at year end.
  */
-export function projectAccountSeries(account: Account, holdings: Holding[], years: number): number[] {
+export function projectAccountSeries(account: Account, holdings: Holding[], years: number, monthly = false): number[] {
   const months = Math.max(0, Math.round(years * 12));
   const base = acceptsContributions(account) ? Math.max(0, num(account.monthlyContribution)) : 0;
   const growth = account.contributionGrowth ? num(account.contributionGrowthRate) : 0;
@@ -52,7 +52,7 @@ export function projectAccountSeries(account: Account, holdings: Holding[], year
     const series = [value];
     for (let month = 0; month < months; month += 1) {
       value = value * (1 + rate) + contributionAt(month);
-      if ((month + 1) % 12 === 0) series.push(value);
+      if (monthly || (month + 1) % 12 === 0) series.push(value);
     }
     return series;
   }
@@ -69,7 +69,7 @@ export function projectAccountSeries(account: Account, holdings: Holding[], year
     const contribution = contributionAt(month);
     cash = cash * (1 + cashRate) + contribution * split.cash;
     for (let index = 0; index < values.length; index += 1) values[index] = values[index] * (1 + rates[index]) + contribution * split.holdings[index];
-    if ((month + 1) % 12 === 0) series.push(sum());
+    if (monthly || (month + 1) % 12 === 0) series.push(sum());
   }
   return series;
 }
@@ -86,7 +86,7 @@ export type Amortization = {
  * Standard monthly amortization. `monthlyPayment` must be principal and interest only:
  * escrowed tax and insurance never touch the balance.
  */
-export function amortize(liability: Liability, years: number): Amortization {
+export function amortize(liability: Liability, years: number, monthly = false): Amortization {
   const months = Math.max(0, Math.round(years * 12));
   const rate = num(liability.rate) / 100 / 12;
   const payment = Math.max(0, num(liability.monthlyPayment)) + Math.max(0, num(liability.extraMonthly));
@@ -106,7 +106,7 @@ export function amortize(liability: Liability, years: number): Amortization {
         if (balance <= 0 && payoffMonths === null) payoffMonths = month + 1;
       }
     }
-    if ((month + 1) % 12 === 0) balances.push(balance);
+    if (monthly || (month + 1) % 12 === 0) balances.push(balance);
   }
 
   return {

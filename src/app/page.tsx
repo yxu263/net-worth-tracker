@@ -2,23 +2,26 @@
 
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, ArrowUpFromLine, House as HouseIcon, Landmark, Plus, RefreshCw, Settings2, Trash2, TrendingUp, X } from "lucide-react";
-import { accountTypes, demoData, returnLabel, selfCompounding, type Account, type AccountSnapshot, type AccountType, type Holding, type Liability, type TrackerData } from "@/lib/types";
+import { accountTypes, assetClasses, DEFAULT_INFLATION, demoData, returnLabel, selfCompounding, type Account, type AccountSnapshot, type AccountType, type AssetClass, type Goal, type Holding, type Liability, type TrackerData } from "@/lib/types";
 import { acceptsContributions, amortize, expectedBalance, payoffDate, payoffLabel, payoffMonths, projectAccountSeries } from "@/lib/forecast";
 import type { SourceHistoryRow } from "@/lib/source-import";
 import { buildNetWorthSeries, type RangeKey } from "@/lib/history";
 import { fetchQuote, fetchQuotes } from "@/lib/pricing";
 import { todayIso } from "@/lib/date";
-import { mergeData, normalizeTrackerData, parseEnvelope, toEnvelope } from "@/lib/backup";
+import { markDeleted, markRevived, mergeData, normalizeTrackerData, parseEnvelope, toEnvelope } from "@/lib/backup";
 import { fetchRemote, uploadRemote } from "@/lib/github-sync";
 import { defaultSettings, loadSettings, loadSyncState, saveSettings, saveSyncState, syncConfigured, syncTarget, type AppSettings, type SyncState } from "@/lib/settings";
 import { downloadFile } from "@/lib/export";
+import { cpiLastMonth, deflate, inTodaysDollars } from "@/lib/inflation";
+import type { AllocationItem } from "@/lib/allocation";
+import { accountTotal, money, safeNumber } from "@/lib/values";
 import NetWorthChart from "@/components/net-worth-chart";
 import SettingsForm from "@/components/settings-form";
 import ExportPanel from "@/components/export-panel";
+import AllocationTab from "@/components/allocation-tab";
+import GoalsTab from "@/components/goals-tab";
 
-const money = (value: number) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
 const priceText = (value: number) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
-const safeNumber = (value: unknown, fallback = 0) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
 /** Plain-English source of a quote so a stale close is never mistaken for a live price. */
 const basisLabel = (quote?: { basis?: string; asOf?: string; asOfTime?: string }) => {
   if (!quote) return "price updated";
@@ -58,7 +61,6 @@ const sourceIsDebt = (name: string, liabilities: Liability[] = []) => {
   return debtPattern.test(name) || liabilities.some(item => item.id === key || normalizeName(item.name) === key);
 };
 const sourceIsProperty = (name: string) => name.trim().toLowerCase() === "home";
-const accountTotal = (account: Account, holdings: Holding[]) => account.cashConfigured ? safeNumber(account.balance) + holdings.filter(holding => holding.accountId === account.id).reduce((sum, holding) => sum + safeNumber(holding.quantity) * safeNumber(holding.price), 0) : safeNumber(account.balance);
 /**
  * Reads saved data. `failed` is true only when stored data existed but could not be read,
  * which must never be persisted over the original: the raw text is copied aside instead.
@@ -125,6 +127,7 @@ function loadData(): { data: TrackerData; failed: boolean } {
   }
 }
 const today = () => todayIso();
+const greeting = (hour = new Date().getHours()) => hour < 5 ? "Good evening" : hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
 /** How often to re-quote while the regular session is running. Kept conservative so
  * Yahoo's public endpoint is not rate-limited or blocked. */
 const priceRefreshMs = 60 * 60 * 1000;
@@ -147,22 +150,23 @@ function snapshotCurrent(current: TrackerData, date: string) {
   const aggregate = (current.snapshots ?? []).find(item => item.date === date);
   if (!aggregate || !sameMoney(aggregate.assets, assets) || !sameMoney(aggregate.liabilities, liabilities)) return false;
   const saved = new Map((current.accountSnapshots ?? []).filter(item => item.date === date).map(item => [item.accountId, item.balance]));
-  return (current.accounts ?? []).every(account => {
-    const balance = saved.get(account.id);
-    return balance !== undefined && sameMoney(balance, accountTotal(account, current.holdings ?? []));
-  });
+  const matches = (id: string, value: number) => { const balance = saved.get(id); return balance !== undefined && sameMoney(balance, value); };
+  return (current.accounts ?? []).every(account => matches(account.id, accountTotal(account, current.holdings ?? [])))
+    && (current.liabilities ?? []).every(liability => matches(liability.id, -safeNumber(liability.balance)));
 }
 /**
- * Records `date` as an aggregate entry plus one entry per account, at each account's
- * displayed total (cash plus linked holdings) so composed accounts keep their holdings.
- * Idempotent by date: an existing entry for the same day is replaced, never duplicated.
+ * Records `date` as an aggregate entry plus one entry per account and per debt (stored
+ * negative, as imports do), at each account's displayed total (cash plus linked holdings)
+ * so composed accounts keep their holdings. Idempotent by date: an existing entry for the
+ * same day is replaced, never duplicated.
  */
 function withSnapshot(current: TrackerData, date: string): TrackerData {
   const { assets, liabilities, netWorth } = totals(current);
+  const withAccounts = (current.accounts ?? []).reduce((all, account) => upsertAccountSnapshot(all, account.id, date, accountTotal(account, current.holdings ?? [])), current.accountSnapshots ?? []);
   return {
     ...current,
     snapshots: [...(current.snapshots ?? []).filter(item => item.date !== date), { date, assets, liabilities, netWorth }].sort((a, b) => a.date.localeCompare(b.date)),
-    accountSnapshots: (current.accounts ?? []).reduce((all, account) => upsertAccountSnapshot(all, account.id, date, accountTotal(account, current.holdings ?? [])), current.accountSnapshots ?? []),
+    accountSnapshots: (current.liabilities ?? []).reduce((all, liability) => upsertAccountSnapshot(all, liability.id, date, -safeNumber(liability.balance)), withAccounts),
   };
 }
 
@@ -186,7 +190,11 @@ function findImportConflicts(rows: SourceHistoryRow[], existing: AccountSnapshot
 export default function Home() {
   const [data, setData] = useState<TrackerData>(demoData);
   const [hydrated, setHydrated] = useState(false);
-  const [tab, setTab] = useState<"accounts" | "holdings" | "forecast">("accounts");
+  const [tab, setTab] = useState<"accounts" | "holdings" | "allocation" | "forecast" | "goals">("accounts");
+  // "Today's dollars" is a viewing preference, kept per device rather than synced.
+  const [real, setReal] = useState(false);
+  useEffect(() => { setReal(window.localStorage.getItem("nwt-real-dollars") === "1"); }, []);
+  const toggleReal = (next: boolean) => { setReal(next); window.localStorage.setItem("nwt-real-dollars", next ? "1" : "0"); };
   const [modal, setModal] = useState<"account" | "liability" | "holding" | null>(null);
   const [editing, setEditing] = useState<Account | Liability | Holding | null>(null);
   const [tickerEdit, setTickerEdit] = useState<string | null>(null);
@@ -419,6 +427,11 @@ export default function Home() {
   const netWorthSeries = useMemo(() => buildNetWorthSeries(data.accountSnapshots ?? [], data.snapshots ?? []), [data.accountSnapshots, data.snapshots]);
   const focusAccount = focusAccountId ? data.accounts.find(account => account.id === focusAccountId) ?? null : null;
   const accountSeries = useMemo(() => focusAccountId ? buildNetWorthSeries((data.accountSnapshots ?? []).filter(row => row.accountId === focusAccountId)) : [], [data.accountSnapshots, focusAccountId]);
+  const inflation = safeNumber(data.inflationRate, DEFAULT_INFLATION);
+  /** Restates history in today's purchasing power using published CPI-U. */
+  const inReal = useMemo(() => (series: typeof netWorthSeries) => real ? series.map(point => ({ ...point, value: inTodaysDollars(point.value, point.date, dayStamp, inflation) })) : series, [real, dayStamp, inflation]);
+  const chartNote = real ? `in today's dollars (CPI-U to ${cpiLastMonth()})` : undefined;
+  const realToggle = <label title="Show past values in today's purchasing power, using the official US consumer price index" className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#dfe5e9] px-3 py-2 text-sm"><input type="checkbox" checked={real} onChange={event => toggleReal(event.target.checked)} />Today&apos;s dollars</label>;
   const importConflicts = useMemo(() => folderPreview ? findImportConflicts(folderPreview.rows, data.accountSnapshots ?? []) : null, [folderPreview, data.accountSnapshots]);
   function focusOnAccount(account: Account) { setFocusAccountId(account.id); window.scrollTo({ top: 0, behavior: "smooth" }); }
   function flash(message: string) { setNotice(message); window.setTimeout(() => setNotice(""), 4000); }
@@ -472,14 +485,46 @@ export default function Home() {
     setTickerEdit(null);
     flash(`${ticker} set to ${rate}% across ${touched} account${touched === 1 ? "" : "s"}`);
   }
-  /** Deleting an account or liability also drops its dated snapshots, and an account drops its linked holdings, so nothing lingers in history totals. */
+  /**
+   * Deleting an account or liability also drops its dated snapshots, and an account drops its
+   * linked holdings, so nothing lingers in history totals. Asks first, because history cannot
+   * be recovered, and leaves a deletion marker so a sync merge does not bring it back.
+   */
   function remove(kind: "accounts" | "liabilities" | "holdings", itemId: string) {
+    const item = (data[kind] as Array<{ id: string; name?: string; ticker?: string }>).find(entry => entry.id === itemId);
+    if (!item) return;
+    const historyRows = kind === "holdings" ? 0 : (data.accountSnapshots ?? []).filter(snapshot => snapshot.accountId === itemId).length;
+    const linked = kind === "accounts" ? data.holdings.filter(holding => holding.accountId === itemId) : [];
+    const label = kind === "holdings" ? `${item.ticker} in ${data.accounts.find(account => account.id === (item as Holding).accountId)?.name ?? "this account"}` : item.name;
+    const consequences = [historyRows ? `${historyRows.toLocaleString()} dated balance${historyRows === 1 ? "" : "s"} of history` : "", linked.length ? `${linked.length} linked holding${linked.length === 1 ? "" : "s"} (${linked.map(holding => holding.ticker).join(", ")})` : ""].filter(Boolean);
+    if (!window.confirm(`Delete ${label}?${consequences.length ? `\n\nThis also deletes ${consequences.join(" and ")}.` : ""}\n\nThis cannot be undone. Export a backup first if you might need it.`)) return;
     setData(current => {
-      const next: TrackerData = { ...current, [kind]: current[kind].filter(item => item.id !== itemId) };
+      const next: TrackerData = { ...current, [kind]: current[kind].filter(entry => entry.id !== itemId) };
+      const removedHoldings = kind === "accounts" ? (current.holdings ?? []).filter(holding => holding.accountId === itemId).map(holding => holding.id) : [];
       if (kind === "accounts" || kind === "liabilities") next.accountSnapshots = (current.accountSnapshots ?? []).filter(snapshot => snapshot.accountId !== itemId);
       if (kind === "accounts") next.holdings = (current.holdings ?? []).filter(holding => holding.accountId !== itemId);
+      next.deleted = markDeleted(current.deleted, [itemId, ...removedHoldings]);
       return next;
     });
+    if (kind === "accounts" && focusAccountId === itemId) setFocusAccountId(null);
+  }
+  function saveGoal(goal: Goal) {
+    setData(current => ({ ...current, goals: (current.goals ?? []).some(item => item.id === goal.id) ? (current.goals ?? []).map(item => item.id === goal.id ? goal : item) : [...(current.goals ?? []), goal] }));
+    flash(`Goal saved: ${goal.name}`);
+  }
+  function removeGoal(goal: Goal) {
+    if (!window.confirm(`Delete the goal "${goal.name}"?`)) return;
+    setData(current => ({ ...current, goals: (current.goals ?? []).filter(item => item.id !== goal.id), deleted: markDeleted(current.deleted, [goal.id]) }));
+  }
+  /** A ticker's class applies to every position in it; an account's class covers its own balance. */
+  function setAssetClass(item: AllocationItem, assetClass: AssetClass | undefined) {
+    setData(current => item.kind === "ticker"
+      ? { ...current, holdings: current.holdings.map(holding => tickerKey(holding.ticker) === item.id ? { ...holding, assetClass } : holding) }
+      : { ...current, accounts: current.accounts.map(account => account.id === item.id ? { ...account, assetClass } : account) });
+  }
+  function setInflation(rate: number) {
+    if (!Number.isFinite(rate)) return;
+    setData(current => ({ ...current, inflationRate: rate }));
   }
   const savedToday = useMemo(() => (data.snapshots ?? []).some(item => item.date === dayStamp), [data.snapshots, dayStamp]);
 
@@ -527,7 +572,7 @@ export default function Home() {
       latestByAccount.forEach(latestRow => { const name = latestRow.accountName; if (latestRow.debt) { const existing = liabilities.find(item => item.id === latestRow.accountId); if (existing) existing.balance = Math.abs(latestRow.balance); else liabilities.push({ id: latestRow.accountId, name, institution: preview.institution, balance: Math.abs(latestRow.balance), rate: 0 }); } else { const existing = accounts.find(item => item.id === latestRow.accountId); if (existing) { if (!existing.cashConfigured) existing.balance = latestRow.balance; } else accounts.push({ id: latestRow.accountId, name, institution: preview.institution, type: sourceIsProperty(name) ? "property" : "other", balance: latestRow.balance, color: sourceIsProperty(name) ? "#d8ae75" : "#8aa9e8", expectedAnnualReturn: 0 }); } });
       const snapshotMap = new Map((current.accountSnapshots ?? []).map(row => [`${row.accountId}-${row.date}`, row]));
       latest.forEach((row, key) => snapshotMap.set(key, { accountId: row.accountId, date: row.date, balance: row.balance }));
-      return { ...current, accounts, liabilities, accountSnapshots: [...snapshotMap.values()].sort((a, b) => a.date.localeCompare(b.date)) };
+      return { ...current, accounts, liabilities, accountSnapshots: [...snapshotMap.values()].sort((a, b) => a.date.localeCompare(b.date)), deleted: markRevived(current.deleted, [...latestByAccount.keys()]) };
     });
     setFolderPreview(null);
     setImporting(false);
@@ -535,7 +580,12 @@ export default function Home() {
     }, 0);
   }
   function exportCsv() {
-    const rows = ["type,id,name,institution,accountType,balance,rate,accountId,ticker,quantity,costBasis,price", ...data.accounts.map(a => `account,${a.id},"${a.name}","${a.institution}",${a.type},${a.balance},,,,,,`), ...data.liabilities.map(l => `liability,${l.id},"${l.name}","${l.institution}",,${l.balance},${l.rate},,,,,`), ...data.holdings.map(h => `holding,${h.id},,,, , ,${h.accountId},${h.ticker},${h.quantity},${h.costBasis},${h.price}`)];
+    const cell = (value: unknown) => { const text = value === undefined || value === null ? "" : String(value); return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
+    const line = (cells: unknown[]) => cells.map(cell).join(",");
+    const rows = ["type,id,name,institution,accountType,balance,rate,accountId,ticker,quantity,costBasis,price",
+      ...data.accounts.map(a => line(["account", a.id, a.name, a.institution, a.type, a.balance, "", "", "", "", "", ""])),
+      ...data.liabilities.map(l => line(["liability", l.id, l.name, l.institution, "", l.balance, l.rate, "", "", "", "", ""])),
+      ...data.holdings.map(h => line(["holding", h.id, "", "", "", "", "", h.accountId, h.ticker, h.quantity, h.costBasis, h.price]))];
     downloadFile(`net-worth-positions-${today()}.csv`, rows.join("\n"), "text/csv");
   }
   function exportBackup() {
@@ -567,7 +617,8 @@ export default function Home() {
         const importedAccounts = new Map((imported.accounts ?? []).map(account => [account.id, account]));
         const importedLiabilities = new Map((imported.liabilities ?? []).map(item => [item.id, item]));
         const importedHoldings = new Map((imported.holdings ?? []).map(item => [item.id, item]));
-        return { ...current, accounts: [...current.accounts.map(account => importedAccounts.get(account.id) ?? account), ...[...importedAccounts.values()].filter(account => !current.accounts.some(existing => existing.id === account.id))], liabilities: [...current.liabilities.map(item => importedLiabilities.get(item.id) ?? item), ...[...importedLiabilities.values()].filter(item => !current.liabilities.some(existing => existing.id === item.id))], holdings: [...current.holdings.map(item => importedHoldings.get(item.id) ?? item), ...[...importedHoldings.values()].filter(item => !current.holdings.some(existing => existing.id === item.id))], accountSnapshots };
+        // Imported rows update the fields the CSV carries and keep everything else (forecast settings, asset class, price stamps).
+        return { ...current, accounts: [...current.accounts.map(account => importedAccounts.has(account.id) ? { ...account, ...importedAccounts.get(account.id), color: account.color } : account), ...[...importedAccounts.values()].filter(account => !current.accounts.some(existing => existing.id === account.id))], liabilities: [...current.liabilities.map(item => importedLiabilities.has(item.id) ? { ...item, ...importedLiabilities.get(item.id) } : item), ...[...importedLiabilities.values()].filter(item => !current.liabilities.some(existing => existing.id === item.id))], holdings: [...current.holdings.map(item => importedHoldings.has(item.id) ? { ...item, ...importedHoldings.get(item.id) } : item), ...[...importedHoldings.values()].filter(item => !current.holdings.some(existing => existing.id === item.id))], accountSnapshots, deleted: markRevived(current.deleted, [...importedAccounts.keys(), ...importedLiabilities.keys(), ...importedHoldings.keys()]) };
       });
       setNotice("CSV imported; existing records preserved"); setTimeout(() => setNotice(""), 2500);
     }; reader.readAsText(file); event.target.value = "";
@@ -605,13 +656,15 @@ export default function Home() {
   }
   return <main className="min-h-screen">
     <header className="border-b border-[#e7ebef] bg-white"><div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-5"><div className="flex items-center gap-3"><div className="rounded-xl bg-[#17212b] p-2 text-white"><TrendingUp size={20} /></div><div><div className="text-lg font-bold">Net Worth Tracker</div><div className="text-xs text-[#718096]">Your private wealth dashboard</div></div></div><div className="flex items-center gap-2 text-sm text-[#718096]"><span title={savedToday ? `Today's figures are recorded in your history (${dayStamp})` : "History is recorded automatically once your accounts load"} className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs"><span className={`h-2 w-2 rounded-full ${savedToday ? "bg-[#66c9a0]" : "bg-[#d7dde3]"}`} />{savedToday ? "History saved today" : "Saving history…"}</span><button onClick={() => setPanel("settings")} title={syncInfo.error ?? syncInfo.detail ?? "Sync settings"} className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs hover:bg-[#f7f8fa]"><span className={`h-2 w-2 rounded-full ${syncInfo.kind === "ok" ? "bg-[#66c9a0]" : syncInfo.kind === "err" ? "bg-[#e07a6f]" : syncInfo.kind === "warn" || syncInfo.kind === "busy" ? "bg-[#e8c98f]" : "bg-[#d7dde3]"}`} />{syncInfo.text}</button><button onClick={() => setPanel("settings")} aria-label="Settings" title="Settings" className="rounded-lg p-2 hover:bg-[#f7f8fa]"><Settings2 size={18} /></button></div></div></header>
-    <div className="mx-auto max-w-6xl px-6 py-8"><div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="mb-1 text-sm text-[#718096]">Good evening</p><h1 className="text-3xl font-bold tracking-tight">Your net worth</h1></div><div className="flex flex-wrap gap-2"><label title="Choose a folder of Date,Balance,Account CSV files" className="cursor-pointer rounded-lg bg-[#17212b] px-3 py-2 text-sm text-white">Import from data folder<input type="file" multiple ref={element => { element?.setAttribute("webkitdirectory", ""); }} onChange={importAccountHistory} className="hidden" /></label><label className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#e7ebef] bg-white px-3 py-2 text-sm"><ArrowUpFromLine size={15} /> Import CSV<input type="file" accept=".csv" onChange={importCsv} className="hidden" /></label><label title="Restore a Net Worth Tracker JSON backup from another device" className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#e7ebef] bg-white px-3 py-2 text-sm"><ArrowUpFromLine size={15} /> Import backup<input type="file" accept=".json,application/json" onChange={importBackup} className="hidden" /></label><button onClick={() => setPanel("export")} className="flex items-center gap-2 rounded-lg border border-[#e7ebef] bg-white px-3 py-2 text-sm"><ArrowDownToLine size={15} /> Export</button></div></div>
-      <div className="mb-7 grid items-start gap-4 md:grid-cols-3"><div className="md:col-span-2 min-w-0">{focusAccount ? <NetWorthChart key={focusAccount.id} series={accountSeries} range={chartRange} onRangeChange={setChartRange} label={focusAccount.name} onBack={() => setFocusAccountId(null)} /> : <NetWorthChart series={netWorthSeries} range={chartRange} onRangeChange={setChartRange} />}</div><div className="card p-6"><p className="text-sm text-[#718096]">Assets minus liabilities</p><div className="mt-5 space-y-4"><Metric label="Total assets" value={money(assets)} color="#66c9a0" /><Metric label="Total liabilities" value={money(debts)} color="#ee9b8c" /></div><div className="mt-5 h-2 overflow-hidden rounded-full bg-[#f0f2f4]"><div className="bar h-full" style={{ width: `${Math.min(100, assets / Math.max(1, assets + debts) * 100)}%` }} /></div></div></div>
+    <div className="mx-auto max-w-6xl px-6 py-8"><div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="mb-1 text-sm text-[#718096]">{greeting()}</p><h1 className="text-3xl font-bold tracking-tight">Your net worth</h1></div><div className="flex flex-wrap gap-2"><label title="Choose a folder of Date,Balance,Account CSV files" className="cursor-pointer rounded-lg bg-[#17212b] px-3 py-2 text-sm text-white">Import from data folder<input type="file" multiple ref={element => { element?.setAttribute("webkitdirectory", ""); }} onChange={importAccountHistory} className="hidden" /></label><label className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#e7ebef] bg-white px-3 py-2 text-sm"><ArrowUpFromLine size={15} /> Import CSV<input type="file" accept=".csv" onChange={importCsv} className="hidden" /></label><label title="Restore a Net Worth Tracker JSON backup from another device" className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#e7ebef] bg-white px-3 py-2 text-sm"><ArrowUpFromLine size={15} /> Import backup<input type="file" accept=".json,application/json" onChange={importBackup} className="hidden" /></label><button onClick={() => setPanel("export")} className="flex items-center gap-2 rounded-lg border border-[#e7ebef] bg-white px-3 py-2 text-sm"><ArrowDownToLine size={15} /> Export</button></div></div>
+      <div className="mb-7 grid items-start gap-4 md:grid-cols-3"><div className="md:col-span-2 min-w-0">{focusAccount ? <NetWorthChart key={focusAccount.id} series={inReal(accountSeries)} range={chartRange} onRangeChange={setChartRange} label={focusAccount.name} onBack={() => setFocusAccountId(null)} note={chartNote} actions={realToggle} /> : <NetWorthChart series={inReal(netWorthSeries)} range={chartRange} onRangeChange={setChartRange} note={chartNote} actions={realToggle} />}</div><div className="card p-6"><p className="text-sm text-[#718096]">Assets minus liabilities</p><div className="mt-5 space-y-4"><Metric label="Total assets" value={money(assets)} color="#66c9a0" /><Metric label="Total liabilities" value={money(debts)} color="#ee9b8c" /></div><div className="mt-5 h-2 overflow-hidden rounded-full bg-[#f0f2f4]"><div className="bar h-full" style={{ width: `${Math.min(100, assets / Math.max(1, assets + debts) * 100)}%` }} /></div></div></div>
       {loadFailed && <div className="mb-6 rounded-xl border border-[#e0a3a0] bg-[#fdecea] p-4 text-sm"><p className="font-semibold text-[#8a2f2a]">Saved data could not be read</p><p className="mt-1 text-[#8a2f2a]">The demo dataset is shown below and <strong>nothing will be saved</strong> until this is resolved, so your stored data is left intact. The unreadable copy was preserved under the <code>nest-egg-data.corrupt</code> browser key. Re-import from your data folder to rebuild.</p></div>}
-      <nav className="mb-6 flex gap-1 overflow-x-auto rounded-xl bg-white p-1 shadow-sm">{([["accounts", "Accounts & debts"], ["holdings", "Holdings"], ["forecast", "Forecast"]] as const).map(([value, label]) => <button key={value} onClick={() => setTab(value)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-medium ${tab === value ? "tab-active" : "tab"}`}>{label}</button>)}</nav>
+      <nav className="mb-6 flex gap-1 overflow-x-auto rounded-xl bg-white p-1 shadow-sm">{([["accounts", "Accounts & debts"], ["holdings", "Holdings"], ["allocation", "Allocation"], ["forecast", "Forecast"], ["goals", "Goals"]] as const).map(([value, label]) => <button key={value} onClick={() => setTab(value)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-medium ${tab === value ? "tab-active" : "tab"}`}>{label}</button>)}</nav>
       {tab === "accounts" && <Accounts data={data} assets={assets} open={(kind, item) => { setModal(kind); setEditing(item ?? null); }} remove={remove} importHistory={importAccountHistory} focus={focusOnAccount} focusedId={focusAccountId} catchUp={catchUpLiability} />}
       {tab === "holdings" && <Holdings data={data} refresh={() => void syncPrices()} pricing={pricing} open={(item) => { setModal("holding"); setEditing(item ?? null); }} openTicker={setTickerEdit} remove={remove} />}
-      {tab === "forecast" && <Forecast data={data} />}
+      {tab === "allocation" && <AllocationTab data={data} setClass={setAssetClass} />}
+      {tab === "forecast" && <Forecast data={data} real={real} inflation={inflation} setReal={toggleReal} setInflation={setInflation} />}
+      {tab === "goals" && <GoalsTab data={data} real={real} inflation={inflation} today={dayStamp} saveGoal={saveGoal} removeGoal={removeGoal} />}
     </div>
     {notice && <div className="fixed bottom-5 left-1/2 -translate-x-1/2 rounded-lg bg-[#17212b] px-4 py-3 text-sm text-white shadow-lg">{notice}</div>}
     {folderPreview && <Modal title={folderPreview.title} close={() => { if (!importing) setFolderPreview(null); }}><div className="space-y-4"><p className="text-sm text-[#718096]">The following CSV files are ready to merge. Accounts and dates that are not present in the import are left untouched.</p><div className="grid grid-cols-3 gap-2"><div className="rounded-lg bg-[#f7f8fa] p-3 text-center"><strong className="block text-xl">{folderPreview.files.length}</strong><span className="text-xs text-[#718096]">files</span></div><div className="rounded-lg bg-[#f7f8fa] p-3 text-center"><strong className="block text-xl">{folderPreview.names.length}</strong><span className="text-xs text-[#718096]">accounts</span></div><div className="rounded-lg bg-[#f7f8fa] p-3 text-center"><strong className="block text-xl">{folderPreview.rows.length.toLocaleString()}</strong><span className="text-xs text-[#718096]">rows</span></div></div>{importConflicts && importConflicts.changed > 0 ? <div className="rounded-lg border border-[#e8c98f] bg-[#fdf6e7] p-3 text-sm"><p className="font-semibold text-[#8a6417]">Warning: {importConflicts.changed.toLocaleString()} existing dated balance{importConflicts.changed === 1 ? "" : "s"} will be overwritten</p><p className="mt-1 text-[#8a6417]">Dates {importConflicts.earliest} to {importConflicts.latest} already hold a different value and will be replaced by the imported numbers. This cannot be undone.</p><ul className="mt-2 space-y-0.5 text-xs text-[#8a6417]">{importConflicts.accounts.slice(0, 5).map(([name, count]) => <li key={name}>{name}: {count.toLocaleString()} date{count === 1 ? "" : "s"}</li>)}{importConflicts.accounts.length > 5 && <li>+{importConflicts.accounts.length - 5} more accounts</li>}</ul></div> : <p className="rounded-lg bg-[#eef6f2] p-3 text-sm text-[#2f8d68]">No existing values will be changed{importConflicts && importConflicts.identical > 0 ? `; ${importConflicts.identical.toLocaleString()} rows already match` : ""}.</p>}<div className="max-h-28 overflow-y-auto rounded-lg border border-[#e7ebef] p-3 text-sm">{folderPreview.files.map(file => <div key={file} className="py-1 text-[#718096]">{file}</div>)}</div>{importing && <p className="rounded-lg bg-[#eef6f2] p-3 text-sm text-[#2f8d68]">Importing and saving {folderPreview.rows.length.toLocaleString()} rows...</p>}<div className="flex justify-end gap-2"><button disabled={importing} onClick={() => setFolderPreview(null)} className="rounded-lg border border-[#e7ebef] px-4 py-2 text-sm disabled:opacity-50">Cancel</button><button disabled={importing} onClick={confirmDataFolderImport} className={`rounded-lg px-4 py-2 text-sm text-white disabled:opacity-50 ${importConflicts && importConflicts.changed > 0 ? "bg-[#b9762f]" : "bg-[#17212b]"}`}>{importing ? "Importing..." : importConflicts && importConflicts.changed > 0 ? "Overwrite and import" : "Confirm import"}</button></div></div></Modal>}
@@ -694,7 +747,7 @@ function ChangeBadge({ percent }: { percent?: number }) {
   return <span className="text-xs font-medium" style={{ color }} title="Change from the prior trading day's close">{flat ? "" : percent > 0 ? "+" : ""}{percent.toFixed(2)}%</span>;
 }
 /** One forecast: asset accounts stack above the zero line, debts stack below it, sharing a horizon and axis. */
-function Forecast({ data }: { data: TrackerData }) {
+function Forecast({ data, real, inflation, setReal, setInflation }: { data: TrackerData; real: boolean; inflation: number; setReal: (real: boolean) => void; setInflation: (rate: number) => void }) {
   const [years, setYears] = useState(10);
   const accounts = useMemo(() => Array.isArray(data.accounts) ? data.accounts : [], [data.accounts]);
   const holdings = useMemo(() => Array.isArray(data.holdings) ? data.holdings : [], [data.holdings]);
@@ -708,10 +761,15 @@ function Forecast({ data }: { data: TrackerData }) {
 
   const assetSeries = useMemo(() => new Map(accounts.map(account => [account.id, projectAccountSeries(account, holdings, years)])), [accounts, holdings, years]);
   const debtSchedules = useMemo(() => new Map(liabilities.map(liability => [liability.id, amortize(liability, years)])), [liabilities, years]);
-  const assetAt = (account: Account, year: number) => safeNumber(assetSeries.get(account.id)?.[year], safeNumber(account.balance));
-  const debtAt = (liability: Liability, year: number) => safeNumber(debtSchedules.get(liability.id)?.balances[year], safeNumber(liability.balance));
+  // In today's dollars every future figure is discounted at the assumed inflation rate.
+  const realAt = (value: number, year: number) => real ? deflate(value, year * 12, inflation) : value;
+  const assetAt = (account: Account, year: number) => realAt(safeNumber(assetSeries.get(account.id)?.[year], safeNumber(account.balance)), year);
+  const debtAt = (liability: Liability, year: number) => realAt(safeNumber(debtSchedules.get(liability.id)?.balances[year], safeNumber(liability.balance)), year);
   const onAccount = (account: Account) => pickedAccounts.includes(account.id);
   const onDebt = (liability: Liability) => pickedDebts.includes(liability.id);
+  // Imported totals and holdings with no expected return are projected flat, which is easy to miss.
+  const flatAccounts = accounts.filter(account => onAccount(account) && (account.type === "investment" || account.type === "retirement") && (!account.cashConfigured || !holdings.some(holding => holding.accountId === account.id)) && safeNumber(account.expectedAnnualReturn) === 0 && accountTotal(account, holdings) > 0);
+  const flatTickers = [...new Set(holdings.filter(holding => accounts.some(account => account.id === holding.accountId && account.cashConfigured && onAccount(account)) && safeNumber(holding.expectedAnnualReturn) === 0).map(holding => tickerKey(holding.ticker)))];
 
   const steps = Array.from({ length: years + 1 }, (_, year) => year);
   const assetTotal = (year: number) => accounts.filter(onAccount).reduce((sum, account) => sum + Math.max(0, assetAt(account, year)), 0);
@@ -741,12 +799,17 @@ function Forecast({ data }: { data: TrackerData }) {
     <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
       <div>
         <h2 className="font-semibold">Forecast</h2>
-        <p className="text-sm text-[#718096]">Projected net worth at year {years}: <strong className="text-[#17212b]">{money(netAt(years))}</strong></p>
+        <p className="text-sm text-[#718096]">Projected net worth at year {years}: <strong className="text-[#17212b]">{money(netAt(years))}</strong>{real ? <span className="ml-1 text-xs">in today&apos;s dollars ({money(real ? netAt(years) * Math.pow(1 + inflation / 100, years) : netAt(years))} nominal)</span> : null}</p>
         <p className="text-xs text-[#718096]">{money(assetTotal(years))} in assets &middot; {money(debtTotal(years))} still owed &middot; {money(totalInterest)} interest paid</p>
       </div>
-      <label className="text-sm"><span className="mr-2 text-[#718096]">Horizon</span><select aria-label="Forecast horizon" value={years} onChange={event => setYears(Number(event.target.value))} className="rounded-lg border border-[#dfe5e9] px-3 py-2">{[1, 5, 10, 15, 20, 30].map(value => <option key={value} value={value}>{value} years</option>)}</select></label>
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#dfe5e9] px-3 py-2"><input type="checkbox" checked={real} onChange={event => setReal(event.target.checked)} />Today&apos;s dollars</label>
+        <label className="flex items-center gap-2"><span className="text-[#718096]">Inflation</span><input aria-label="Assumed annual inflation (%)" type="number" step="0.1" min="0" max="20" defaultValue={inflation} key={inflation} onBlur={event => setInflation(Number(event.target.value))} onKeyDown={event => { if (event.key === "Enter") setInflation(Number((event.target as HTMLInputElement).value)); }} className="w-16 rounded-lg border border-[#dfe5e9] px-2 py-2 text-right" /><span className="text-[#718096]">%</span></label>
+        <label><span className="mr-2 text-[#718096]">Horizon</span><select aria-label="Forecast horizon" value={years} onChange={event => setYears(Number(event.target.value))} className="rounded-lg border border-[#dfe5e9] px-3 py-2">{[1, 5, 10, 15, 20, 30].map(value => <option key={value} value={value}>{value} years</option>)}</select></label>
+      </div>
     </div>
     {pickedAccounts.length === 0 && pickedDebts.length === 0 && <p className="mb-4 rounded-lg bg-[#f7f8fa] p-3 text-sm text-[#718096]">Select at least one account or debt below to show a projection.</p>}
+    {(flatAccounts.length > 0 || flatTickers.length > 0) && <p className="mb-4 rounded-lg bg-[#fdf6e7] p-3 text-sm text-[#8a6417]">Projected with 0% growth: {[...flatAccounts.map(account => account.name), ...flatTickers].join(", ")}. {flatAccounts.length ? "Set an expected return with Edit on the account" : ""}{flatAccounts.length && flatTickers.length ? "; for holdings, " : flatTickers.length ? "Set it for holdings by " : ""}{flatTickers.length ? "selecting the ticker on the Holdings tab" : ""}.</p>}
     {shortfall.length > 0 && <p className="mb-4 rounded-lg bg-[#fdecea] p-3 text-sm text-[#b95d57]">The payment on {shortfall.map(liability => liability.name).join(", ")} does not cover the first month&apos;s interest, so that balance would never fall.</p>}
 
     <div className="mb-1 text-[10px] uppercase tracking-wide text-[#718096]">Assets above the line, debts below</div>
@@ -806,7 +869,7 @@ function Forecast({ data }: { data: TrackerData }) {
       </table>
     </div>
     <p className="mt-2 text-xs text-[#718096]">Totals cover the selected rows only; unticked accounts and debts are dimmed and excluded from the chart and every total.</p>
-    <p className="mt-5 text-xs text-[#718096]">Assumptions: balances are stepped month by month. Cash and savings compound at the account return; property compounds at its expected annual appreciation, which may be negative; composed investment and retirement accounts use each linked holding&apos;s own return plus their cash. Uncomposed imported totals grow at the account return, which is 0% until you set one. Monthly contributions are added at the end of each month and, when inflation growth is on, step up on every anniversary, and default to today&apos;s holding mix treated as a fixed target allocation. A contribution can be set to stop after a chosen number of years &mdash; for retirement, say &mdash; after which the balance keeps compounding but receives no new money. Debts assume a fixed rate and a payment every month, entered as principal and interest only &mdash; escrowed tax and insurance do not reduce a balance. A debt with no payment set is simply held flat. Property and liabilities take no contributions. Adjustable rates, PMI removal, and recasts are not modelled.</p>
+    <p className="mt-5 text-xs text-[#718096]">Assumptions: balances are stepped month by month. Cash and savings compound at the account return; property compounds at its expected annual appreciation, which may be negative; composed investment and retirement accounts use each linked holding&apos;s own return plus their cash. Uncomposed imported totals grow at the account return, which is 0% until you set one. Monthly contributions are added at the end of each month and, when inflation growth is on, step up on every anniversary, and default to today&apos;s holding mix treated as a fixed target allocation. A contribution can be set to stop after a chosen number of years &mdash; for retirement, say &mdash; after which the balance keeps compounding but receives no new money. Debts assume a fixed rate and a payment every month, entered as principal and interest only &mdash; escrowed tax and insurance do not reduce a balance. A debt with no payment set is simply held flat. Property and liabilities take no contributions. Adjustable rates, PMI removal, and recasts are not modelled. With <em>Today&apos;s dollars</em> on, every future figure is divided by (1 + inflation)<sup>years</sup> at the inflation rate above, so the chart shows purchasing power rather than the nominal amount.</p>
   </section>;
 }
 /** Keeps a selection in sync with the current ids, adding new ones and dropping deleted ones. */
@@ -916,7 +979,7 @@ function Modal({ title, close, children, wide = false }: { title: string; close:
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, []);
-  return <div className="fixed inset-0 z-10 flex items-center justify-center bg-[#17212b]/40 p-5"><div ref={panel} tabIndex={-1} role="dialog" aria-modal="true" aria-label={title} className={`card w-full ${wide ? "max-w-2xl" : "max-w-md"} p-6 outline-none`}><div className="mb-5 flex items-center justify-between"><h2 className="text-lg font-semibold capitalize">{title}</h2><button type="button" aria-label="Close" onClick={close}><X size={20} /></button></div>{children}{hasForm && <p className="mt-4 text-center text-[11px] text-[#a0aab5]">Enter to save &middot; Esc to cancel</p>}</div></div>;
+  return <div className="fixed inset-0 z-10 flex items-center justify-center bg-[#17212b]/40 p-5"><div ref={panel} tabIndex={-1} role="dialog" aria-modal="true" aria-label={title} className={`card max-h-[calc(100dvh-2.5rem)] w-full overflow-y-auto overscroll-contain ${wide ? "max-w-2xl" : "max-w-md"} p-6 outline-none`}><div className="mb-5 flex items-center justify-between"><h2 className="text-lg font-semibold capitalize">{title}</h2><button type="button" aria-label="Close" onClick={close}><X size={20} /></button></div>{children}{hasForm && <p className="mt-4 text-center text-[11px] text-[#a0aab5]">Enter to save &middot; Esc to cancel</p>}</div></div>;
 }
 const Field = ({ label, name, defaultValue, type = "text" }: { label: string; name: string; defaultValue?: string | number; type?: string }) => <label className="mb-4 block text-sm"><span className="mb-1 block text-[#718096]">{label}</span><input name={name} type={type} defaultValue={defaultValue} required step={type === "number" ? "any" : undefined} className="w-full rounded-lg border border-[#dfe5e9] px-3 py-2 outline-none focus:border-[#3b7fbd]" /></label>;
 function FormActions() { return <div className="flex justify-end gap-2"><button type="submit" className="rounded-lg bg-[#17212b] px-4 py-2 text-sm text-white">Save</button></div>; }

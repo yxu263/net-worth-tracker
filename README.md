@@ -40,7 +40,19 @@ Prices are fetched in the browser (`src/lib/pricing.ts`) through the Worker from
 
 ## Sync
 
-With GitHub sync on, the app pulls on open and when the tab regains focus, and pushes a few seconds after any change. If only one side changed it simply pulls or pushes; if both changed (two devices edited offline) the records are merged, newer edit wins per account/holding/dated balance. A record deleted on one device can reappear after such a merge; delete it again. Today's automatic snapshot and price refresh wait for the first pull so a stale device never overwrites newer balances. The header shows sync status; click it for details.
+With GitHub sync on, the app pulls on open and when the tab regains focus, and pushes a few seconds after any change. If only one side changed it simply pulls or pushes; if both changed (two devices edited offline) the records are merged, newer edit wins per account/holding/dated balance. Deletions are recorded as markers that sync too, so a record deleted on one device stays deleted after a merge; re-importing it later brings it back. Today's automatic snapshot and price refresh wait for the first pull so a stale device never overwrites newer balances. The header shows sync status; click it for details.
+
+## Allocation
+
+The **Allocation** tab shows assets by class: US stocks, international stocks, bonds, cash, real estate, other. Classify each ticker once (it applies in every account holding it) and each account's own balance: the cash in a brokerage account, or the whole value of an imported total such as a 401(k). Cash and savings accounts default to Cash and property to Real estate; anything else stays *Unassigned* until chosen. Holdings linked to an imported total are not counted again, matching the account total. Untick **Include property** for an investable-assets view. Debts are not subtracted.
+
+## Today's dollars (inflation)
+
+The **Today's dollars** toggle above the history chart restates past balances in today's purchasing power using the official US CPI-U (BLS series CUUR0000SA0, monthly, built into `src/lib/cpi-data.ts`; months after the table ends use the assumed rate). The same toggle in **Forecast** discounts every projected figure by the assumed annual inflation set there (default 2.5%, synced with your data). The toggle itself is remembered per device.
+
+## Goals
+
+The **Goals** tab tracks targets for net worth, one account's balance, or paying off a debt, with progress and an estimated date from the Forecast assumptions (month by month, up to 50 years). Add an optional target date to see *On track* or *Behind*. Debt progress is measured from the highest balance on record. With **Today's dollars** on, targets are read in today's dollars.
 
 ## Export and import
 
@@ -97,6 +109,7 @@ Each save writes two things, both keyed to the date and both **idempotent** — 
 
 - One **aggregate** entry holding `assets`, `liabilities`, and `netWorth`.
 - One **per-account** entry for every account, recorded at the account's displayed total, i.e. cash **plus** linked holdings for a composed account. Composed accounts therefore keep their holdings in the trend rather than dropping to bare cash.
+- One **per-debt** entry for every liability, stored as a negative balance like imported debt history, so editing a debt's balance shows up in its history and in the history export.
 
 The header shows a dot and **History saved today** once the day is recorded. Saving is deliberately skipped while the demo fallback is showing over real saved data, and while saved data is unreadable, so a bad read can never overwrite your history. Earlier dates are never rewritten — only today's entry is touched.
 
@@ -110,7 +123,7 @@ Both import paths (data folder and **Bulk import CSVs**) now stop at the same re
 
 ## Accounts
 
-Account editing and composition are a single dialog. Press **Edit** beside an account (or **+** to add one) and set its name, institution, type, and **cash balance**. The account total is never edited directly: it is cash plus the market value of the holdings linked to that account, so holdings are counted exactly once in net worth. Link holdings from the **Holdings** tab by selecting the account there.
+Account editing and composition are a single dialog. Press **Edit** beside an account (or **+** to add one) and set its name, institution, type, and **cash balance**. The account total is never edited directly: it is cash plus the market value of the holdings linked to that account, so holdings are counted exactly once in net worth. Link holdings from the **Holdings** tab by selecting the account there. Deleting an account, debt or holding asks for confirmation first and lists the history and linked holdings that go with it.
 
 Account types are cash/checking, **savings**, investment, retirement, property, and other. For property and other accounts the cash field is relabelled as the account value. Cash and savings accounts compound their balance at the account's expected annual return in Forecast.
 

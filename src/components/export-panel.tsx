@@ -24,7 +24,7 @@ export default function ExportPanel({ data, exportPositions, exportBackup, notif
     notify(`Exported ${rows.toLocaleString()} row${rows === 1 ? "" : "s"} for ${picked.size} account${picked.size === 1 ? "" : "s"}`);
   }
 
-  return <div className="max-h-[70vh] space-y-5 overflow-y-auto pr-1 text-sm">
+  return <div className="space-y-5 text-sm">
     <section>
       <h3 className="mb-1 font-semibold">Daily balance history (CSV)</h3>
       <p className="mb-3 text-xs text-[#718096]">For spreadsheets and other apps. Debts are exported as negative balances.</p>
